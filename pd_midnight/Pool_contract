@@ -1,0 +1,153 @@
+// ============================================================
+// CONTRACT: POOL VALIDATOR (Két Sắt Thanh Khoản)
+// Mô tả:
+// 1. Giữ tài sản của LP (Reserve A, Reserve B).
+// 2. Thực thi logic hoán đổi AMM (x * y = k).
+// 3. Phân chia phí Protocol (Protocol Cut).
+// ============================================================
+
+import "dex_types.compact"
+
+contract Pool {
+    // --- STATE ---
+    ledger field factory: ContractId;       // Địa chỉ Factory tạo ra Pool này
+    ledger field lp_policy: ContractId;     // Địa chỉ Policy duy nhất được quyền rút tiền
+
+    ledger field token_a: AssetId;
+    ledger field token_b: AssetId;
+
+    // Dự trữ công khai (Public Reserves) - Cần thiết để User tính giá Swap
+    ledger field reserve_a: Uint64;
+    ledger field reserve_b: Uint64;
+
+    ledger field fee_config: FeeConfig;
+    ledger field protocol_fee_to: PublicKey;
+    ledger field is_paused: Boolean;
+
+    // --- CONSTRUCTOR ---
+    constructor(
+        _token_a: AssetId,
+        _token_b: AssetId,
+        _factory: ContractId,
+        _protocol_fee_to: PublicKey
+    ) {
+        token_a = _token_a;
+        token_b = _token_b;
+        factory = _factory;
+        protocol_fee_to = _protocol_fee_to;
+
+        reserve_a = 0;
+        reserve_b = 0;
+        is_paused = false;
+
+        // Mặc định: Phí 0.3% (30 bps), Protocol lấy ~1/6 (16.66% của 0.3% = 0.05%)
+        fee_config = FeeConfig { total_fee_bps: 30, protocol_cut_bps: 1666 };
+    }
+
+    // --- INITIALIZATION (Thiết lập ban đầu) ---
+    // Được gọi duy nhất 1 lần bởi Factory ngay sau khi deploy
+    transition set_lp_policy(policy_id: ContractId) {
+        assert(caller == factory, "Error: Unauthorized Caller (Must be Factory)");
+        // Đảm bảo chưa từng set trước đó (Chống ghi đè chiếm quyền)
+        assert(lp_policy == ContractId(0), "Error: Policy already set");
+        lp_policy = policy_id;
+    }
+
+    // --- SWAP LOGIC (Hoán đổi Token) ---
+    // Hàm này được Batcher gọi để khớp lệnh Swap của User.
+    transition swap(
+        amount_in: Uint64,
+        min_out: Uint64,
+        is_token_a_in: Boolean, // True nếu bán A -> mua B, False nếu ngược lại
+        to: PublicKey           // Địa chỉ nhận tiền (ẩn danh - Shielded Address)
+    ) {
+        // Kiểm tra an toàn cơ bản
+        assert(!is_paused, "Error: Pool Paused");
+        assert(amount_in > 0, "Error: Zero Input");
+
+        // Xác định Reserve vào và ra tương ứng
+        let _reserve_in = is_token_a_in ? reserve_a : reserve_b;
+        let _reserve_out = is_token_a_in ? reserve_b : reserve_a;
+
+        // BƯỚC 1: Tính toán Phí
+        // Tổng phí thu = Input * 0.3%
+        let total_fee = (amount_in * fee_config.total_fee_bps) / BASIS_POINTS_DIVISOR;
+        // Phí Protocol = Tổng phí * 16.66%
+        let protocol_fee = (total_fee * fee_config.protocol_cut_bps) / BASIS_POINTS_DIVISOR;
+        // Số tiền thực sự tham gia vào công thức AMM (sau khi trừ tổng phí)
+        let amount_in_after_fee = amount_in - total_fee;
+
+        // BƯỚC 2: Công thức AMM Constant Product (x * y = k)
+        // Output = (Input_After_Fee * Reserve_Out) / (Reserve_In + Input_After_Fee)
+        let numerator = amount_in_after_fee * _reserve_out;
+        let denominator = _reserve_in + amount_in_after_fee;
+        let amount_out = numerator / denominator;
+
+        // Kiểm tra Trượt giá (Slippage Check)
+        assert(amount_out >= min_out, "Error: Slippage too high (Price changed badly)");
+
+        // BƯỚC 3: Cập nhật Trạng thái (Ledger State)
+        if (is_token_a_in) {
+            // Reserve A tăng thêm = Input gốc - Phí Protocol (Phí LP được giữ lại trong Pool)
+            reserve_a += (amount_in - protocol_fee);
+            reserve_b -= amount_out;
+            // Chuyển phí Protocol đi ngay lập tức (hoặc tích lũy - ở đây chuyển luôn)
+            if (protocol_fee > 0) send_token(token_a, protocol_fee, protocol_fee_to);
+        } else {
+            reserve_b += (amount_in - protocol_fee);
+            reserve_a -= amount_out;
+            if (protocol_fee > 0) send_token(token_b, protocol_fee, protocol_fee_to);
+        }
+
+        // BƯỚC 4: Trả tiền cho User (Settlement)
+        let out_token = is_token_a_in ? token_b : token_a;
+        send_token(out_token, amount_out, to);
+    }
+
+    // --- LIQUIDITY SYNC (Chỉ dành cho LP Policy) ---
+    // Được gọi khi User Nạp tiền (Mint LP). Hàm này xác nhận tiền đã vào ví Contract chưa.
+    transition sync(expected_res_a: Uint64, expected_res_b: Uint64) {
+        assert(!is_paused, "Error: Pool Paused");
+        // Quan trọng: Chỉ LP Policy mới được gọi hàm này
+        assert(caller == lp_policy, "Error: Unauthorized (Only LP Policy)");
+
+        // Kiểm tra số dư thực tế trong UTxO của Contract (Native Balance)
+        let actual_balance_a = balance(token_a);
+        let actual_balance_b = balance(token_b);
+
+        // Đảm bảo số dư thực tế >= Số dư mong đợi (User đã nạp đủ tiền)
+        // Batcher có nhiệm vụ gom Input của User vào Transaction gọi hàm này.
+        assert(actual_balance_a >= expected_res_a, "Error: Insufficient A deposited into UTxO");
+        assert(actual_balance_b >= expected_res_b, "Error: Insufficient B deposited into UTxO");
+
+        // Cập nhật Ledger State để khớp với Balance thực tế
+        reserve_a = expected_res_a;
+        reserve_b = expected_res_b;
+    }
+
+    // --- WITHDRAW ASSETS (Chỉ dành cho LP Policy) ---
+    // Được gọi khi User Rút tiền (Burn LP). Pool thực hiện chuyển token trả User.
+    transition withdraw_assets(amount_a: Uint64, amount_b: Uint64, to: PublicKey) {
+        // Vẫn cho phép rút tiền kể cả khi Pool đang Pause (Emergency Withdraw)
+        assert(caller == lp_policy, "Error: Unauthorized (Only LP Policy)");
+
+        // Kiểm tra xem Pool còn đủ tiền không (Sanity Check)
+        assert(reserve_a >= amount_a, "Error: Not enough A in reserve");
+        assert(reserve_b >= amount_b, "Error: Not enough B in reserve");
+
+        // Trừ Reserve
+        reserve_a -= amount_a;
+        reserve_b -= amount_b;
+
+        // Thực hiện chuyển khoản on-chain
+        send_token(token_a, amount_a, to);
+        send_token(token_b, amount_b, to);
+    }
+
+    // --- ADMIN ---
+    transition set_paused(status: Boolean, caller_contract: ContractId) {
+        // Chỉ Factory (Admin) mới có quyền Pause
+        assert(caller_contract == factory, "Error: Only Factory can pause");
+        is_paused = status;
+    }
+}

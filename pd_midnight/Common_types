@@ -1,0 +1,36 @@
+// ============================================================
+// LIBRARY: COMMON TYPES & SAFE MATH
+// Mô tả: Định nghĩa các cấu trúc dữ liệu dùng chung cho toàn hệ thống.
+// ============================================================
+
+// Cấu trúc định danh tài sản trên Midnight (tương tự Native Token trên Cardano)
+export struct AssetId {
+    policy_id: Bytes,  // Mã chính sách đúc (Policy ID)
+    token_name: Bytes  // Tên Token (HEX encoded)
+}
+
+// Cấu hình phí giao dịch (Fee Configuration)
+// Sử dụng đơn vị Basis Points (bps) để tránh số thập phân.
+// 1 bps = 0.01%, 100 bps = 1%, 10000 bps = 100%.
+export struct FeeConfig {
+    total_fee_bps: Uint64,   // Tổng phí thu từ User (Ví dụ: 30 = 0.3%)
+    protocol_cut_bps: Uint64 // Phần trăm trong tổng phí được trích về Treasury (Ví dụ: 1666 ~= 1/6 tổng phí)
+}
+
+// Các loại lệnh mà hệ thống hỗ trợ
+export enum OrderType {
+    SWAP_EXACT_IN,      // Bán chính xác số lượng A -> Nhận tối thiểu B
+    SWAP_EXACT_OUT,     // Mua chính xác số lượng B -> Trả tối đa A
+    DEPOSIT_LIQUIDITY,  // Thêm thanh khoản (Nạp A + B -> Nhận LP)
+    WITHDRAW_LIQUIDITY  // Rút thanh khoản (Trả LP -> Nhận A + B)
+}
+
+// --- HẰNG SỐ HỆ THỐNG ---
+
+// Số lượng LP Token tối thiểu bị khóa vĩnh viễn khi tạo Pool.
+// Mục đích: Chống tấn công lạm phát (Inflation Attack) - một lỗi kinh điển trong AMM.
+// Kẻ tấn công không thể làm lệch giá trị 1 share quá lớn nếu đã có 1 lượng nhỏ bị khóa.
+export const MINIMUM_LIQUIDITY: Uint64 = 1000;
+
+// Mẫu số chung cho các phép tính phần trăm (100.00%)
+export const BASIS_POINTS_DIVISOR: Uint64 = 10000;

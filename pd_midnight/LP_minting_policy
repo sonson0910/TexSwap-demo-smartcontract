@@ -1,0 +1,107 @@
+// ============================================================
+// CONTRACT: LP MINTING POLICY (Chính sách đúc LP)
+// Mô tả:
+// 1. Quản lý việc In (Mint) và Đốt (Burn) Token LP.
+// 2. Tách biệt khỏi Pool để đảm bảo an toàn logic.
+// ============================================================
+import "dex_types.compact"
+
+contract LPMintingPolicy {
+    ledger field target_pool: ContractId; // Pool mà Policy này quản lý
+    ledger field total_supply: Uint64;    // Tổng cung LP Token đang lưu hành
+
+    constructor(_target_pool: ContractId) {
+        target_pool = _target_pool;
+        total_supply = 0;
+    }
+
+    // --- MINT (Thêm Thanh Khoản) ---
+    transition mint(amount_a_deposited: Uint64, amount_b_deposited: Uint64, to: PublicKey) {
+        // BƯỚC 1: Đọc trạng thái hiện tại của Pool (Remote Read)
+        // Cần biết Reserve hiện tại để tính tỷ lệ chia
+        let pool_state = remote_read(target_pool);
+        let _reserve_a = pool_state.reserve_a;
+        let _reserve_b = pool_state.reserve_b;
+
+        // BƯỚC 2: Tính toán lượng LP được phép in
+        let liquidity: Uint64;
+
+        if (total_supply == 0) {
+            // Trường hợp 1: Pool mới tinh (Initial Deposit)
+            // LP = Căn bậc 2 (A * B) - MINIMUM_LIQUIDITY
+            liquidity = sqrt(amount_a_deposited * amount_b_deposited);
+            assert(liquidity > MINIMUM_LIQUIDITY, "Error: Initial liquidity too small");
+            liquidity -= MINIMUM_LIQUIDITY;
+
+            // Khóa vĩnh viễn lượng thanh khoản tối thiểu (Gửi về địa chỉ 0)
+            // Để ngăn chặn tấn công làm tròn số (rounding manipulation)
+            mint_token(self.token_id, MINIMUM_LIQUIDITY, address(0));
+            total_supply += MINIMUM_LIQUIDITY;
+        } else {
+            // Trường hợp 2: Nạp thêm vào Pool đã có
+            // Tính theo tỷ lệ tài sản nào ít hơn (để tránh làm loãng giá trị Pool)
+            // LP = Min( (A_nạp / A_cũ) * Total, (B_nạp / B_cũ) * Total )
+            let liq_a = (amount_a_deposited * total_supply) / _reserve_a;
+            let liq_b = (amount_b_deposited * total_supply) / _reserve_b;
+            liquidity = min(liq_a, liq_b);
+        }
+
+        assert(liquidity > 0, "Error: Insufficient liquidity minted");
+
+        // BƯỚC 3: Đồng bộ với Pool (Quan trọng)
+        // Gọi hàm 'sync' bên Pool để xác nhận Pool đã nhận được tiền nạp vào.
+        // Nếu Pool chưa nhận được tiền, hàm sync sẽ fail -> Transaction revert -> Không in LP.
+        remote_call(target_pool, sync(_reserve_a + amount_a_deposited, _reserve_b + amount_b_deposited));
+
+        // BƯỚC 4: In LP Token trả cho User
+        total_supply += liquidity;
+        mint_token(self.token_id, liquidity, to);
+    }
+
+    // --- BURN (Rút Thanh Khoản) ---
+    transition burn(liquidity_amount: Uint64, to: PublicKey) {
+        assert(total_supply > 0, "Error: No supply");
+        assert(liquidity_amount > 0, "Error: Zero burn amount");
+
+        let pool_state = remote_read(target_pool);
+
+        // BƯỚC 1: Tính toán lượng Token gốc trả lại
+        // Amount = (LP_đốt * Reserve) / Total_Supply
+        let amount_a = (liquidity_amount * pool_state.reserve_a) / total_supply;
+        let amount_b = (liquidity_amount * pool_state.reserve_b) / total_supply;
+
+        // BƯỚC 2: Đốt LP Token của User
+        // User cần ký transaction này để chứng minh sở hữu LP
+        burn_token(self.token_id, liquidity_amount, self);
+        total_supply -= liquidity_amount;
+
+        // BƯỚC 3: Ra lệnh cho Pool trả tiền
+        // Gọi hàm 'withdraw_assets' bên Pool.
+        // Pool sẽ kiểm tra người gọi có phải là Policy không trước khi chuyển tiền.
+        remote_call(target_pool, withdraw_assets(amount_a, amount_b, to));
+    }
+
+    // --- MATH HELPERS (Thư viện toán học) ---
+
+    // Tính căn bậc 2 (Babylonian method)
+    internal fn sqrt(y: Uint64) -> Uint64 {
+        if (y > 3) {
+            let z = y;
+            let x = (y / 2) + 1;
+            while (x < z) {
+                z = x;
+                x = (y / x + x) / 2;
+            }
+            return z;
+        } else if (y != 0) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    // Tìm số nhỏ nhất
+    internal fn min(x: Uint64, y: Uint64) -> Uint64 {
+        return x < y ? x : y;
+    }
+}

@@ -1,0 +1,91 @@
+// ============================================================
+// CONTRACT: FACTORY (Cục Đăng Kiểm & Quản Trị)
+// Mô tả:
+// 1. Quản lý việc tạo Pool mới (Deploy).
+// 2. Thiết lập mối quan hệ tin cậy (Trust Setup) giữa Pool và LP Policy.
+// 3. Quản trị hệ thống (Admin, Fee, Pause).
+// ============================================================
+
+import "dex_types.compact"
+import "dex_pool.compact"
+import "dex_lp_minting_policy.compact"
+
+contract Factory {
+    // --- STATE (TRẠNG THÁI LEDGER) ---
+    ledger field admin: PublicKey;           // Admin tối cao (có quyền dừng hệ thống)
+    ledger field fee_to: PublicKey;          // Địa chỉ ví Treasury nhận phí sàn
+    ledger field is_system_paused: Boolean;  // Công tắc khẩn cấp (Circuit Breaker)
+
+    // Registry: Bản đồ lưu trữ các Pool đã tạo.
+    // Key: Hash(TokenA + TokenB) -> Value: Địa chỉ Contract của Pool
+    ledger field pool_registry: Map<Bytes, ContractId>;
+
+    // Khởi tạo Factory
+    constructor(_admin: PublicKey, _fee_to: PublicKey) {
+        admin = _admin;
+        fee_to = _fee_to;
+        is_system_paused = false;
+    }
+
+    // --- 1. CREATE POOL (Tạo Pool Mới) ---
+    // Hàm này thực hiện quy trình "Atomic Deployment" (Triển khai nguyên tử)
+    transition create_pool(token_a: AssetId, token_b: AssetId) -> ContractId {
+        // Kiểm tra xem hệ thống có đang bảo trì không
+        assert(!is_system_paused, "Error: System is paused");
+
+        // Tạo ID duy nhất cho cặp token (Sắp xếp A-B để tránh trùng lặp với B-A)
+        let pair_hash = hash_pair(token_a, token_b);
+        assert(!pool_registry.has(pair_hash), "Error: Pool already exists");
+
+        // BƯỚC 1: Deploy Pool Contract
+        // Truyền địa chỉ Factory (self) để Pool biết ai tạo ra nó.
+        // Truyền địa chỉ nhận phí (fee_to) để Pool biết chuyển phí về đâu.
+        let new_pool_id = deploy_contract(Pool, token_a, token_b, self, fee_to);
+
+        // BƯỚC 2: Deploy LP Policy Contract
+        // Policy này được gắn cứng (hard-coded) với ID của Pool vừa tạo.
+        let new_policy_id = deploy_contract(LPMintingPolicy, new_pool_id);
+
+        // BƯỚC 3: Setup Trust (Thiết lập tin cậy 2 chiều)
+        // Pool cần biết địa chỉ của Policy để cho phép Policy rút tiền (Withdraw).
+        // Ta gọi hàm 'set_lp_policy' trên Pool mới tạo.
+        remote_call(new_pool_id, set_lp_policy(new_policy_id));
+
+        // BƯỚC 4: Lưu vào Sổ Đăng Ký
+        pool_registry.insert(pair_hash, new_pool_id);
+
+        return new_pool_id;
+    }
+
+    // --- 2. ADMIN FUNCTIONS (Chức năng Quản trị) ---
+
+    // Thay đổi địa chỉ nhận phí (Treasury)
+    transition set_fee_to(new_fee_to: PublicKey, caller: PublicKey, sig: Signature) {
+        // Xác thực chữ ký Admin
+        assert(caller == admin && verify_sig(sig, caller), "Error: Unauthorized");
+        fee_to = new_fee_to;
+        // Lưu ý: Việc đổi fee_to ở đây chỉ áp dụng cho các Pool tạo mới.
+        // Các Pool cũ cần có cơ chế update riêng nếu muốn đồng bộ.
+    }
+
+    // Bật/Tắt chế độ bảo trì toàn hệ thống
+    transition set_system_pause(status: Boolean, caller: PublicKey, sig: Signature) {
+        assert(caller == admin && verify_sig(sig, caller), "Error: Unauthorized");
+        is_system_paused = status;
+    }
+
+    // Gỡ niêm yết Pool (Delisting) - Dùng khi phát hiện Pool lừa đảo
+    transition remove_pool(token_a: AssetId, token_b: AssetId, caller: PublicKey, sig: Signature) {
+        assert(caller == admin && verify_sig(sig, caller), "Error: Unauthorized");
+        let pair_hash = hash_pair(token_a, token_b);
+        if (pool_registry.has(pair_hash)) {
+            pool_registry.remove(pair_hash);
+        }
+    }
+
+    // Hàm phụ trợ: Hash cặp token ID
+    internal fn hash_pair(a: AssetId, b: AssetId) -> Bytes {
+        // Luôn sắp xếp ID nhỏ trước lớn sau để đảm bảo tính nhất quán (Canonical Order)
+        return a.policy_id < b.policy_id ? sha256(concat(a, b)) : sha256(concat(b, a));
+    }
+}

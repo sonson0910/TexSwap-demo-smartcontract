@@ -1,0 +1,105 @@
+// ============================================================
+// CONTRACT: ORDER / REQUEST BOX
+// Mô tả:
+// 1. Nơi chứa tiền và ý định của User (Lệnh Swap/Deposit).
+// 2. Sử dụng Witness để ẩn thông tin nhạy cảm (Privacy).
+// 3. Batcher sẽ tiêu thụ UTxO này để thực thi lệnh.
+// ============================================================
+
+import "dex_types.compact"
+
+contract Order {
+    // --- PUBLIC STATE (Ledger) ---
+    // Batcher cần thấy những thông tin này để biết cách xử lý (Routing)
+    ledger field order_type: OrderType;
+    ledger field target_pool_id: ContractId;
+    ledger field batcher_fee: Uint64; // Phí dịch vụ trả cho Batcher (VD: 2 ADA)
+
+    // --- PRIVATE WITNESS (ZK-Hidden Input) ---
+    // Thông tin này chỉ User biết, được mã hóa dưới dạng Proof
+    witness owner_pubkey: PublicKey;      // Chủ sở hữu (để hoàn tiền)
+    witness receiver_pubkey: PublicKey;   // Người nhận tiền (thường là owner)
+
+    // Tài sản đầu vào (Input)
+    witness input_asset_a: AssetId;
+    witness input_amount_a: Uint64;
+    witness input_asset_b: AssetId;       // Dùng cho lệnh Add Liquidity (cần 2 token)
+    witness input_amount_b: Uint64;
+
+    // Điều kiện đầu ra (Output Conditions / Slippage)
+    witness min_output_a: Uint64;
+    witness min_output_b: Uint64;
+    witness deadline: Uint64;             // Thời hạn hiệu lực của lệnh
+
+    // --- CONSTRUCTOR ---
+    constructor(
+        _type: OrderType,
+        _pool: ContractId,
+        _fee: Uint64,
+        _in_asset_a: AssetId, _in_amt_a: Uint64,
+        _in_asset_b: AssetId, _in_amt_b: Uint64,
+        _min_out_a: Uint64, _min_out_b: Uint64,
+        _receiver: PublicKey,
+        _deadline: Uint64
+    ) {
+        order_type = _type;
+        target_pool_id = _pool;
+        batcher_fee = _fee;
+
+        input_asset_a = _in_asset_a;
+        input_amount_a = _in_amt_a;
+        input_asset_b = _in_asset_b;
+        input_amount_b = _in_amt_b;
+
+        min_output_a = _min_out_a;
+        min_output_b = _min_out_b;
+        receiver_pubkey = _receiver;
+        deadline = _deadline;
+    }
+
+    // --- CANCEL (Hủy Lệnh - User Action) ---
+    // Cho phép User rút tiền về nếu đổi ý hoặc Batcher không xử lý kịp
+    transition cancel(current_time: Uint64, user_sig: Signature) {
+        // ZK Verify: Chứng minh người gọi là owner_pubkey
+        assert(verify_sig(user_sig, owner_pubkey), "Error: Unauthorized");
+
+        // Hoàn trả tài sản gốc
+        if (input_amount_a > 0) send_token(input_asset_a, input_amount_a, owner_pubkey);
+        if (input_amount_b > 0) send_token(input_asset_b, input_amount_b, owner_pubkey);
+
+        // Hoàn trả phí Batcher (vì chưa được xử lý)
+        send_native_token(batcher_fee, owner_pubkey);
+    }
+
+    // --- EXECUTE (Khớp Lệnh - Batcher Action) ---
+    // Batcher gọi hàm này sau khi đã tính toán và tương tác với Pool.
+    // Hàm này kiểm tra xem kết quả thực tế có thỏa mãn yêu cầu của User không.
+    transition execute(
+        batcher_sig: Signature,
+        output_received_a: Uint64,
+        output_received_b: Uint64
+    ) {
+        // Kiểm tra thời hạn
+        assert(now() <= deadline, "Error: Order expired");
+
+        // Trả phí dịch vụ cho Batcher (người gọi hàm)
+        send_native_token(batcher_fee, signer_of(batcher_sig));
+
+        // Kiểm tra điều kiện nghiệm thu (Slippage Check)
+        if (order_type == OrderType.SWAP_EXACT_IN) {
+            // Swap A -> B: Kiểm tra lượng B nhận được
+            assert(output_received_b >= min_output_b, "Error: Slippage too high");
+
+        } else if (order_type == OrderType.DEPOSIT_LIQUIDITY) {
+            // Deposit: Kiểm tra lượng LP Token nhận được (quy ước lưu ở output_b)
+            assert(output_received_b >= min_output_b, "Error: Low LP minted");
+
+        } else if (order_type == OrderType.WITHDRAW_LIQUIDITY) {
+            // Withdraw: Phải nhận đủ tối thiểu cả A và B
+            assert(output_received_a >= min_output_a, "Error: Low A withdrawn");
+            assert(output_received_b >= min_output_b, "Error: Low B withdrawn");
+        }
+
+        // Lệnh hoàn tất, UTxO của Order Contract sẽ bị tiêu hủy.
+    }
+}
